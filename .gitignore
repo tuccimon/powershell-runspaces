@@ -1,0 +1,14 @@
+# Ignore Dashboard folder - contains temporary HTML files
+Dashboard/
+
+# Ignore common PowerShell temporary files (optional but recommended)
+*.tmp
+*.log
+
+# Ignore VS Code workspace files (if using VS Code)
+.vscode/
+
+# Ignore any test results or output files
+TestResults/
+*.xml
+
