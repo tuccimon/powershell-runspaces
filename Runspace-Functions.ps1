@@ -52,12 +52,21 @@ function New-RunspaceSessionState {
     }
     
     # Add modules
-    foreach ($ModuleName in $Modules) {
+    $failedModules = @()
+    foreach ($ModuleName in ($Modules | Sort-Object -Unique)) {
         try {
             [void]$initialSessionState.ImportPSModule($ModuleName)
-            Write-Verbose "Added module: $ModuleName"
+            # Verify module exists in session state
+            $moduleExists = $null = $initialSessionState.Commands | Where-Object { 
+                $_.Name -eq $ModuleName -or $_.Module -eq $ModuleName 
+            }
+            if (-not $moduleExists) {
+                $failedModules += $ModuleName
+                Write-Warning "Module '$ModuleName' may not have imported correctly"
+            }
         }
         catch {
+            $failedModules += $ModuleName
             Write-Warning "Failed to add module '$ModuleName': $($_.Exception.Message)"
         }
     }
@@ -113,7 +122,7 @@ function New-RunspacePool {
         [System.Collections.Generic.List[string]]$Modules = [System.Collections.Generic.List[string]]::new(),
         [hashtable]$Variables = @{}
     )
-    
+
     # Create session state if not provided
     if (-not $SessionState) {
         Write-Verbose "Creating new session state"
@@ -128,8 +137,13 @@ function New-RunspacePool {
             $SessionState,
             $Host
         )
+        $runspacePool.ApartmentState = 'STA'
+
+        # Attach tracker to the pool object itself (extend it)
+        $null = $runspacePool | Add-Member -MemberType NoteProperty -Name "Tracker" -Value ([hashtable]::Synchronized(@{})) -Force
+
         [void]$runspacePool.Open()
-        
+
         Write-Verbose "Created RunspacePool with $MinRunspaces-$MaxRunspaces runspaces"
         return $runspacePool
     }
@@ -138,6 +152,73 @@ function New-RunspacePool {
         return $null
     }
 }
+
+
+function Import-RunspaceScriptBlock {
+    <#
+    .SYNOPSIS
+    Imports a script block, conforms it for runspace, and then outputs the updated script block
+   
+    .PARAMETER ScriptBlock
+    The script block to import
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$ScriptBlock
+    )
+
+    ### until a good solution is found, we will be blocking
+    if ($ScriptBlock.Ast.UsingStatements) {
+        throw "Using statements are not supported in runspace script blocks"
+    }
+
+    if ($ScriptBlock.Ast.ParamBlock -and $ScriptBlock.Ast.ParamBlock.Attributes) {
+        throw "Parameter attributes (like [CmdletBinding()]) are not supported"
+    }
+    ###########################################################################
+
+    # Create a new ArrayList for parameters
+    $parameters = [System.Collections.ArrayList]::new()
+
+    # Extract existing parameters
+    if ($ScriptBlock.Ast.ParamBlock) {
+        foreach ($param in $ScriptBlock.Ast.ParamBlock.Parameters.Extent.Text) {
+            [void]$parameters.Add($param)
+        }
+    }
+
+    # inject runspace params
+    [void]$parameters.Add('$Tracker')
+    [void]$parameters.Add('$TaskGuid')
+    $ParamLine = "param({0})" -f ($parameters -join ', ')
+
+    # create signal
+    $signalLine = '$Tracker[$TaskGuid] = @{ ActualStartTime = Get-Date }'
+
+    # Get the body content properly
+    $scriptText = $ScriptBlock.Ast.Extent.Text
+    $paramText = $ScriptBlock.Ast.ParamBlock.Extent.Text
+
+    if ([string]::IsNullOrWhiteSpace($paramText)) {
+        $bodyContent = "$scriptText".Trim('{}').Trim()
+    }
+    else {
+        $bodyContent = "$scriptText".Replace($paramText, '').Trim('{}').Trim()
+    }
+
+    # build updated script block text
+    $updated = @"
+$ParamLine
+
+$signalLine
+
+$bodyContent
+"@
+
+    return ([scriptblock]::Create($updated))
+}
+
 
 function New-RunspaceTask {
     <#
@@ -179,6 +260,9 @@ function New-RunspaceTask {
         [int]$TimeoutSeconds = 30
     )
     
+    # create unique identifier for task
+    $taskGuid = [guid]::NewGuid().ToString()
+
     # Handle auto-naming if no RunspaceId provided
     if (-not $RunspaceId) {
         $timestamp = Get-Date -Format "HHmmss"
@@ -195,28 +279,38 @@ function New-RunspaceTask {
         # Create PowerShell instance
         $powerShell = [PowerShell]::Create()
         $powerShell.RunspacePool = $RunspacePool
-        
+
+        # transform script block for runspace purposes
+        $updatedScriptBlock = Import-RunspaceScriptBlock -ScriptBlock $ScriptBlock
+
         # Add script block with internal scope to avoid data "bleed"
-        [void]$powerShell.AddScript($ScriptBlock, $true)
-        
+        [void]$powerShell.AddScript($updatedScriptBlock, $true)
+
+        # add tracker and taskGuid to parameters
+        [void]$Parameters.Add($RunspacePool.Tracker)
+        [void]$Parameters.Add($taskGuid)
+
         # Add parameters
         foreach ($param in $Parameters) {
             [void]$powerShell.AddArgument($param)
         }
-        
+
         # Start execution
         $asyncHandle = $powerShell.BeginInvoke()
         
         # Return task object
         return [PSCustomObject]@{
+            Guid            = $taskGuid
             RunspaceId      = $RunspaceId
             TaskDescription = $TaskDescription
             CurrentActivity = "Starting..."
             PowerShell      = $powerShell
             AsyncHandle     = $asyncHandle
             StartTime       = Get-Date
+            ActualStartTime = $null
+            Duration        = $null
             TimeoutSeconds  = $TimeoutSeconds
-            Status          = "Running"
+            Status          = "Queued"
             Results         = $null
             HasErrors       = $false
             HasWarnings     = $false
@@ -245,8 +339,6 @@ function Show-VisualProgress {
         [int]$TotalTasks,
         
         [int]$PollingIntervalMs,
-        
-        [System.Collections.Generic.List[string]]$ActivityLog = [System.Collections.Generic.List[string]]::new(),
         
         [switch]$IsFinalDisplay
     )
@@ -290,10 +382,16 @@ function Show-VisualProgress {
     
     # Show individual task progress/status
     foreach ($task in $sortedTasks) {
-        $runtime = if ($task.Status -eq "Running") { 
-            [math]::Round(((Get-Date) - $task.StartTime).TotalSeconds, 1)
+        # In Show-VisualProgress, replace the runtime calculation
+        $runtime = if ($task.Status -eq "Completed" -and $task.ActualStartTime) {
+            $task.Duration
         }
-        else { 
+        elseif ($task.Status -eq "Running" -and $task.ActualStartTime) {
+            # Use ActualStartTime for running tasks
+            [math]::Round(((Get-Date) - $task.ActualStartTime).TotalSeconds, 1)
+        }
+        else {
+            # Fallback to StartTime
             [math]::Round(((Get-Date) - $task.StartTime).TotalSeconds, 1)
         }
         
@@ -310,8 +408,9 @@ function Show-VisualProgress {
         }
         else {
             # For progress display, calculate based on runtime
-            $progress = if ($task.Status -eq "Running") {
-                [math]::Min([math]::Round(($runtime / $task.TimeoutSeconds) * 100), 100)
+            $progress = if ($task.Status -eq "Running" -and $task.ActualStartTime) {
+                $elapsed = ((Get-Date) - $task.ActualStartTime).TotalSeconds
+                [math]::Min([math]::Round(($elapsed / $task.TimeoutSeconds) * 100), 100)
             }
             elseif ($task.Status -eq "Completed") {
                 100
@@ -336,6 +435,7 @@ function Show-VisualProgress {
             "Completed" { "Completed in $($runtime)s" }
             "TimedOut" { "Timed out after $($runtime)s" }
             "Failed" { "Failed after $($runtime)s" }
+            "Queued" { "Task queued - not started" }
             default { "Unknown status" }
         }
         
@@ -346,31 +446,24 @@ function Show-VisualProgress {
     }
     
     # Summary stats
-    $completedTasks = $Tasks | Where-Object { $_.Status -ne "Running" }
+    $completedTasks = $Tasks | Where-Object { $_.Status -in @("Completed", "TimedOut", "Failed") }
     $successfulTasks = $Tasks | Where-Object { $_.Status -eq "Completed" }  
     $failedTasks = $Tasks | Where-Object { $_.Status -in @("TimedOut", "Failed") }
     $runningTasks = $Tasks | Where-Object { $_.Status -eq "Running" }
+    $notStartedTasks = $Tasks | Where-Object { $_.Status -eq "Queued" }
     
     $completedSymbol = $DisplayConfig.Console.Symbols["Completed"]
     $failedSymbol = $DisplayConfig.Console.Symbols["Failed"] 
     $runningSymbol = $DisplayConfig.Console.Symbols["Running"]
+    $queuedSymbol = $DisplayConfig.Console.Symbols["Queued"]
     
     $summaryHeaderColor = if ($IsFinalDisplay) { "Green" } else { "Magenta" }
     $summaryHeaderText = if ($IsFinalDisplay) { "FINAL SUMMARY" } else { "SUMMARY" }
     
     Write-Host "`n$("="*70)" -ForegroundColor $summaryHeaderColor
-    Write-Host "$summaryHeaderText`: $($completedTasks.Count)/$TotalTasks completed | $completedSymbol $($successfulTasks.Count) successful | $failedSymbol $($failedTasks.Count) failed | $runningSymbol $($runningTasks.Count) running" -ForegroundColor Cyan
+    Write-Host "$summaryHeaderText`: $($completedTasks.Count)/$TotalTasks completed | $completedSymbol $($successfulTasks.Count) successful | $failedSymbol $($failedTasks.Count) failed | $queuedSymbol $($notStartedTasks.Count) queued | $runningSymbol $($runningTasks.Count) running" -ForegroundColor Cyan
     Write-Host "$("="*70)" -ForegroundColor $summaryHeaderColor
-    
-    # Show activity log (last few events)
-    if ($ActivityLog.Count -gt 0) {
-        Write-Host "`nRecent Activity:" -ForegroundColor Yellow
-        $recentEvents = $ActivityLog | Select-Object -Last 10
-        foreach ($ev in $recentEvents) {
-            Write-Host "  $ev" -ForegroundColor Gray
-        }
-    }
-    
+
     if ($IsFinalDisplay) {
         Write-Host ""  # Add spacing before next output
     }
@@ -390,8 +483,9 @@ function Wait-RunspaceTask {
     .PARAMETER OutputType
     Type of progress output to display
     
-    .PARAMETER ProgressCallback
-    Optional script block to call for custom progress handling
+    .PARAMETER Force
+    Optional switch, that applies to HtmlDashboard, that prevents the confirmation prompt.
+
     #>
     [CmdletBinding()]
     param(
@@ -403,13 +497,21 @@ function Wait-RunspaceTask {
         [ValidateSet('Quiet', 'Basic', 'Visual', 'HtmlDashboard')]
         [string]$OutputType = 'Basic',
         
-        [scriptblock]$ProgressCallback
+        [switch]$Force
     )
     
+    # Reset dashboard state for new run
+    if ($OutputType -eq 'HtmlDashboard') {
+        $script:lastDashboardState = $null
+        $script:dashboardLaunched = $false
+        Write-Verbose "Reset dashboard state for new monitoring session"
+    }
+
     # Define display configuration with console-safe characters
     $DisplayConfig = @{
         Console = @{
             Symbols       = @{
+                "Queued"    = "[ ]"
                 "Running"   = "[*]"
                 "Completed" = "[/]"
                 "TimedOut"  = "[!]"
@@ -417,6 +519,7 @@ function Wait-RunspaceTask {
                 "Unknown"   = "[?]"
             }
             Colors        = @{
+                "Queued"    = "Gray"
                 "Running"   = "Yellow"
                 "Completed" = "Green"
                 "TimedOut"  = "Red"
@@ -430,11 +533,12 @@ function Wait-RunspaceTask {
         }
         Web     = @{
             Symbols       = @{
-                "Running"   = "⚡"
-                "Completed" = "✅"
-                "TimedOut"  = "⏰"
-                "Failed"    = "❌"
-                "Unknown"   = "❓"
+                "Queued"    = "⏳"      # Hourglass
+                "Running"   = "⚡"      # Lightning
+                "Completed" = "✅"      # Check mark
+                "TimedOut"  = "⏰"      # Alarm clock
+                "Failed"    = "❌"      # X
+                "Unknown"   = "❓"      # Question mark
             }
             ProgressChars = @{
                 "Filled" = "▓"
@@ -443,18 +547,19 @@ function Wait-RunspaceTask {
         }
     }
 
-    if ($OutputType -eq 'HtmlDashboard') {
-        Write-Warning @"
+    if ($OutputType -eq 'HtmlDashboard' -and !($Force)) {
+        $confirmationMessage = @"
 HtmlDashboard mode is experimental. 
 - Dashboard will launch in your browser
 - You may need to manually close the browser tab when done
 - Dashboard files will remain in default or specified Dashboard directory
 - Use Ctrl+C to stop monitoring if needed
-"@
 
-        $response = Read-Host "Continue with WebDashboard mode? (y/N)"
-        if ($response -ne 'y' -and $response -ne 'Y') {
-            Write-Host "Switching to Visual mode instead..." -ForegroundColor Yellow
+Are you sure you want to use this output mode?
+"@
+        $choice = $host.UI.PromptForChoice("HTML Dashboard", $confirmationMessage, @('&Yes','&No'), 1)
+        if ($choice -ne 0) {
+            Write-Host "Switching to Visual Mode instead..." -ForegroundColor Yellow
             $OutputType = 'Visual'
         }
     }
@@ -463,40 +568,56 @@ HtmlDashboard mode is experimental.
     $totalTasks = $Tasks.Count
     $lastVisualUpdate = Get-Date
     
-    # Initialize activity log for Visual mode
-    if ($null -eq $script:ActivityLog -or $script:ActivityLog -isnot [System.Collections.Generic.List[String]]) {
-        $script:ActivityLog = [System.Collections.Generic.List[String]]::new()
-    }
-    
     Write-Verbose "Monitoring $totalTasks runspace tasks with '$OutputType' output"
     
     while ($completedCount -lt $totalTasks) {
         Start-Sleep -Milliseconds $PollingIntervalMs
-        
+        $now = Get-Date
+    
+        # Check tracker for tasks that have actually started
+        foreach ($task in ($Tasks | Where-Object { $_.Status -eq "Queued" })) {
+            $tracker = $task.PowerShell.RunspacePool.Tracker
+            if ($tracker.ContainsKey($task.Guid)) {
+                $task.Status = "Running"
+                $task.ActualStartTime = $tracker[$task.Guid].ActualStartTime
+            }
+        }
+
+        # Now process running tasks
         foreach ($task in ($Tasks | Where-Object { $_.Status -eq "Running" })) {
-            $runtime = (Get-Date) - $task.StartTime
+            # Use ActualStartTime for runtime calculation, fallback to StartTime if something's wrong
+            $startTimeForTimeout = if ($task.ActualStartTime) { 
+                $task.ActualStartTime 
+            }
+            else { 
+                $task.StartTime 
+            }
+    
+            $runtime = $now - $startTimeForTimeout
             $runtimeSeconds = [math]::Round($runtime.TotalSeconds, 1)
-            
-            # Check for timeout
-            if ($runtimeSeconds -ge $task.TimeoutSeconds) {
+            $task.Duration = $runtimeSeconds
+    
+            # Set deadline based on actual start time
+            $deadline = $startTimeForTimeout.AddSeconds($task.TimeoutSeconds)
+    
+            # Check timeout against actual start time
+            if ($now -gt $deadline) {
                 $symbol = $DisplayConfig.Console.Symbols["TimedOut"]
-                if ($OutputType -ne 'Quiet') {
-                    Write-Warning "$symbol Task $($task.TaskDescription) timed out after $runtimeSeconds seconds"
+                if ($OutputType -eq 'Basic') {
+                    Write-Warning "$symbol Task $($task.TaskDescription) timed out after $runtimeSeconds seconds (limit: $($task.TimeoutSeconds)s)"
                 }
-                
-                # Add to activity log
-                [void]$script:ActivityLog.Add("$(Get-Date -Format 'HH:mm:ss') - $symbol $($task.TaskDescription) timed out after $runtimeSeconds seconds")
-                
+            
                 try {
+                    # Stop just this specific task
                     [void]$task.PowerShell.Stop()
                     [void]$task.PowerShell.Dispose()
                 }
                 catch {
-                    if ($OutputType -ne 'Quiet') {
+                    if ($OutputType -notin @('Quiet', 'HtmlDashboard')) {
                         Write-Warning "Error stopping task $($task.TaskDescription): $($_.Exception.Message)"
                     }
                 }
-                
+            
                 $task.Status = "TimedOut"
                 $task.Results = [pscustomobject]@{
                     Status         = "TimedOut"
@@ -504,26 +625,27 @@ HtmlDashboard mode is experimental.
                     TimeoutSeconds = $task.TimeoutSeconds
                 }
                 $completedCount++
+            
+                if ($OutputType -eq 'Basic') {
+                    Write-Host "Task $($task.TaskDescription) marked as TimedOut, completedCount=$completedCount" -ForegroundColor Yellow
+                }
             }
             # Check for completion
             elseif ($task.AsyncHandle.IsCompleted) {
                 $symbol = $DisplayConfig.Console.Symbols["Completed"]
                 $color = $DisplayConfig.Console.Colors["Completed"]
-                
+            
                 if ($OutputType -eq 'Basic') {
                     Write-Host "$symbol Task $($task.TaskDescription) completed after $runtimeSeconds seconds" -ForegroundColor $color
                 }
-                
-                # Add to activity log
-                [void]$script:ActivityLog.Add("$(Get-Date -Format 'HH:mm:ss') - $symbol $($task.TaskDescription) completed after $runtimeSeconds seconds")
-                
+            
                 try {
                     $task.Results = [pscustomobject]($task.PowerShell.EndInvoke($task.AsyncHandle))
                     [void]$task.PowerShell.Dispose()
                     $task.Status = "Completed"
                 }
                 catch {
-                    if ($OutputType -ne 'Quiet') {
+                    if ($OutputType -notin @('Quiet', 'HtmlDashboard')) {
                         Write-Warning "Error getting results from task $($task.TaskDescription): $($_.Exception.Message)"
                     }
                     $task.Status = "Failed"
@@ -533,8 +655,12 @@ HtmlDashboard mode is experimental.
                         Error  = $_.Exception.Message
                     }
                 }
-                
+            
                 $completedCount++
+                
+                if ($OutputType -eq 'Basic') {
+                    Write-Host "Task $($task.TaskDescription) completed, completedCount=$completedCount" -ForegroundColor Green
+                }
             }
         }
         
@@ -550,30 +676,23 @@ HtmlDashboard mode is experimental.
             # Show visual progress bars every few seconds
             $now = Get-Date
             if (($now - $lastVisualUpdate).TotalSeconds -ge 3) {
-                $null = Show-VisualProgress -Tasks $Tasks -DisplayConfig $DisplayConfig -TotalTasks $totalTasks -PollingIntervalMs $PollingIntervalMs -ActivityLog $script:ActivityLog
+                $null = Show-VisualProgress -Tasks $Tasks -DisplayConfig $DisplayConfig -TotalTasks $totalTasks -PollingIntervalMs $PollingIntervalMs
                 $lastVisualUpdate = $now
             }
         }
         elseif ($OutputType -eq 'HtmlDashboard') {
-            $null = Export-RunspaceHtmlDashboard -Tasks $Tasks -LaunchBrowser
-
-            if (-not $dashboardLaunched) {
-                $fullPath = Resolve-Path "Dashboard\dashboard.html"
-                $null = Start-Process $fullPath
-                Write-Host "Dashboard launched in browser!" -ForegroundColor Cyan
-                $dashboardLaunched = $true
-            }
-        }
+            # Only export if tasks have changed OR it's the first run
+            $currentState = ($Tasks | ForEach-Object { "$($_.RunspaceId):$($_.Status):$($_.Progress)" }) -join '|'
+            if ($null -eq $script:lastDashboardState -or $script:lastDashboardState -ne $currentState) {
+                # Pass -Quiet to suppress the "exported" message on subsequent updates
+                $quiet = $script:dashboardLaunched -eq $true
+                $null = Export-RunspaceHtmlDashboard -Tasks $Tasks -LaunchBrowser:(-not $script:dashboardLaunched) -Quiet:$quiet
+                $script:lastDashboardState = $currentState
         
-        # Call progress callback if provided
-        if ($ProgressCallback) {
-            $progressInfo = @{
-                CompletedCount = $completedCount
-                TotalTasks     = $totalTasks
-                RunningTasks   = $Tasks | Where-Object { $_.Status -eq "Running" }
-                CompletedTasks = $Tasks | Where-Object { $_.Status -ne "Running" }
+                if (-not $script:dashboardLaunched) {
+                    $script:dashboardLaunched = $true
+                }
             }
-            & $ProgressCallback $progressInfo
         }
     }
     
@@ -584,9 +703,8 @@ HtmlDashboard mode is experimental.
     
     if ($OutputType -eq 'Visual') {
         # Force one final display update to show completion
-        # Force one final display update to show completion
         Start-Sleep -Milliseconds 500  # Brief pause to let everything settle
-        $null = Show-VisualProgress -Tasks $Tasks -DisplayConfig $DisplayConfig -TotalTasks $totalTasks -PollingIntervalMs $PollingIntervalMs -ActivityLog $script:ActivityLog -IsFinalDisplay
+        $null = Show-VisualProgress -Tasks $Tasks -DisplayConfig $DisplayConfig -TotalTasks $totalTasks -PollingIntervalMs $PollingIntervalMs -IsFinalDisplay
     }
 }
 
@@ -622,12 +740,8 @@ function Get-RunspaceResults {
             TaskDescription = $task.TaskDescription
             Status          = $task.Status
             StartTime       = $task.StartTime
-            RuntimeSeconds  = if ($task.Status -eq "Running") { 
-                [math]::Round(((Get-Date) - $task.StartTime).TotalSeconds, 1) 
-            }
-            else { 
-                [math]::Round(((Get-Date) - $task.StartTime).TotalSeconds, 1) 
-            }
+            ActualStartTime = $task.ActualStartTime
+            RuntimeSeconds  = $task.Duration || [math]::Round(((Get-Date) - $task.StartTime).TotalSeconds, 1)
             TimeoutSeconds  = $task.TimeoutSeconds
             HasErrors       = $task.HasErrors
             HasWarnings     = $task.HasWarnings
@@ -667,7 +781,7 @@ function Get-RunspaceResults {
 function Export-RunspaceHtmlDashboard {
     <#
     .SYNOPSIS
-    Exports runspace progress to a beautiful HTML dashboard with embedded JSON data.
+    Exports runspace progress to a HTML dashboard with embedded JSON data.
     
     .PARAMETER Tasks
     Array of runspace task objects
@@ -680,17 +794,22 @@ function Export-RunspaceHtmlDashboard {
     
     .PARAMETER LaunchBrowser
     Whether to launch the dashboard in browser (only on first creation)
+
+    .PARAMETER Quiet
+    Suppresses the "Dashboard exported" message
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [System.Collections.Generic.List[pscustomobject]]$Tasks,
         
-        [string]$OutputPath = "Dashboard",
+        [string]$OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath "Dashboard"),
         
         [int]$RefreshIntervalSeconds = 2,
         
-        [switch]$LaunchBrowser
+        [switch]$LaunchBrowser,
+
+        [switch]$Quiet
     )
     
     # Create output directory
@@ -727,60 +846,62 @@ function Export-RunspaceHtmlDashboard {
             Completed = ($Tasks | Where-Object { $_.Status -eq "Completed" }).Count
             Running   = ($Tasks | Where-Object { $_.Status -eq "Running" }).Count
             Failed    = ($Tasks | Where-Object { $_.Status -in @("TimedOut", "Failed") }).Count
+            Queued    = ($Tasks | Where-Object { $_.Status -eq "Queued" }).Count
         }
     }
     
     # Convert to JSON for embedding
     $jsonData = $statusData | ConvertTo-Json -Depth 3 -Compress
     
-    # Create HTML with embedded JSON data
+    # Create HTML with embedded JSON data and UTF-8 encoding
     $htmlPath = "$OutputPath\dashboard.html"
-    $dashboardCreated = $false
-
-    if (-not (Test-Path $htmlPath)) {
-        $dashboardCreated = $true
-        Write-Verbose "Dashboard updated with embedded data at: $htmlPath"
-    }
 
     $html = @"
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>PowerShell Runspace Dashboard</title>
-    <meta charset="utf-8">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="$RefreshIntervalSeconds">
+    <title>PowerShell Runspace Dashboard</title>
     <style>
+        * { 
+            box-sizing: border-box; 
+            margin: 0;
+            padding: 0;
+        }
+        
         body { 
-            font-family: 'Segoe UI', 'SF Pro Display', -apple-system, BlinkMacSystemFont, Arial, sans-serif; 
+            font-family: 'Segoe UI', 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji', Arial, sans-serif;
             margin: 0; 
             padding: 20px; 
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            min-height: 100vh; 
+            color: #333; 
         }
         
         .container { 
-            max-width: 1200px; 
+            max-width: 1600px;
             margin: 0 auto; 
             background: rgba(255,255,255,0.95); 
             border-radius: 15px; 
-            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-            overflow: hidden;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1); 
+            overflow: hidden; 
         }
         
         .header { 
             background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%); 
             color: white; 
             padding: 30px; 
-            text-align: center;
-            border-bottom: 4px solid #3498db;
+            text-align: center; 
+            border-bottom: 4px solid #3498db; 
         }
         
         .header h1 { 
             margin: 0 0 10px 0; 
             font-size: 2.5em; 
             font-weight: 300; 
-            letter-spacing: 1px;
+            letter-spacing: 1px; 
         }
         
         .header p { 
@@ -794,22 +915,22 @@ function Export-RunspaceHtmlDashboard {
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
             gap: 20px; 
             padding: 30px; 
-            background: #f8f9fa;
+            background: #f8f9fa; 
         }
         
         .summary-card { 
             background: white; 
             padding: 25px; 
             border-radius: 10px; 
-            box-shadow: 0 4px 6px rgba(0,0,0,0.07);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.07); 
             text-align: center; 
-            border-left: 4px solid;
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            border-left: 4px solid; 
+            transition: transform 0.2s ease, box-shadow 0.2s ease; 
         }
         
-        .summary-card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 15px rgba(0,0,0,0.1);
+        .summary-card:hover { 
+            transform: translateY(-2px); 
+            box-shadow: 0 8px 15px rgba(0,0,0,0.1); 
         }
         
         .summary-card.total { border-left-color: #3498db; }
@@ -826,124 +947,168 @@ function Export-RunspaceHtmlDashboard {
         .summary-card p { 
             margin: 0; 
             color: #666; 
-            font-size: 0.9em;
-            text-transform: uppercase;
-            letter-spacing: 1px;
+            font-size: 0.9em; 
+            text-transform: uppercase; 
+            letter-spacing: 1px; 
         }
         
         .task-container { 
-            padding: 30px; 
+            padding: 20px; 
         }
         
         .task-container h2 { 
-            margin: 0 0 25px 0; 
+            margin: 0 0 20px 0; 
             color: #2c3e50; 
-            font-size: 1.8em;
-            font-weight: 300;
-            border-bottom: 2px solid #ecf0f1;
-            padding-bottom: 10px;
+            font-size: 1.6em; 
+            font-weight: 300; 
+            border-bottom: 1px solid #ecf0f1; 
+            padding-bottom: 8px; 
         }
         
-        .task { 
-            margin-bottom: 20px; 
-            background: white;
-            border-radius: 8px;
+        /* Responsive grid - cards will expand to fill width */
+        .task-grid { 
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
             padding: 20px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-            border-left: 4px solid #ecf0f1;
-            transition: all 0.3s ease;
+            width: 100%;
+        }
+        
+        /* For very large screens, allow cards to grow */
+        @media (min-width: 1920px) {
+            .task-grid {
+                grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+                gap: 25px;
+            }
+        }
+        
+        /* For smaller screens, make cards more compact */
+        @media (max-width: 768px) {
+            .task-grid {
+                grid-template-columns: 1fr;
+                gap: 15px;
+                padding: 15px;
+            }
+            
+            .task {
+                min-height: 180px;
+            }
+        }
+        
+        /* Card styling */
+        .task { 
+            display: flex; 
+            flex-direction: column; 
+            min-height: 200px;
+            background: white; 
+            border-radius: 12px; 
+            padding: 20px; 
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1); 
+            border-left: 6px solid; 
+            transition: all 0.2s ease;
+            width: 100%;
         }
         
         .task.status-running { border-left-color: #f39c12; }
         .task.status-completed { border-left-color: #27ae60; }
         .task.status-failed { border-left-color: #e74c3c; }
         .task.status-timedout { border-left-color: #e67e22; }
+        .task.status-queued { border-left-color: #95a5a6; }
         
-        .task-header { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            margin-bottom: 15px; 
+        .task:hover { 
+            transform: translateY(-2px); 
+            box-shadow: 0 8px 20px rgba(0,0,0,0.15); 
         }
         
-        .task-name {
+        .task-header { 
+            flex: 1; 
+            display: flex; 
+            flex-direction: column; 
+            gap: 12px; 
+        }
+        
+        .task-name { 
+            font-weight: 600; 
+            font-size: 1rem; 
+            line-height: 1.4; 
+            word-break: break-word;
             display: flex;
-            align-items: center;
-            font-weight: 600;
-            font-size: 1.1em;
+            align-items: flex-start;
+            gap: 8px;
         }
         
         .status-icon { 
             font-size: 20px; 
-            margin-right: 12px;
-            min-width: 20px;
+            flex-shrink: 0;
+            display: inline-block;
         }
         
-        .task-status {
-            font-size: 0.9em;
-            color: #666;
-            background: #f8f9fa;
-            padding: 4px 12px;
-            border-radius: 20px;
+        .task-status { 
+            font-size: 0.85em; 
+            color: #666; 
+            background: #f8f9fa; 
+            padding: 4px 10px; 
+            border-radius: 12px; 
+            display: inline-block;
+            width: fit-content;
         }
         
-        .progress-container {
-            margin-top: 10px;
+        .progress-container { 
+            margin-top: auto; 
+            padding-top: 15px; 
         }
         
-        .progress-label {
-            display: flex;
-            justify-content: space-between;
-            font-size: 0.85em;
-            color: #666;
-            margin-bottom: 5px;
+        .progress-label { 
+            display: flex; 
+            justify-content: space-between; 
+            font-size: 0.85em; 
+            color: #666; 
+            margin-bottom: 6px; 
         }
         
         .progress-bar { 
             width: 100%; 
             height: 8px; 
             background-color: #ecf0f1; 
-            border-radius: 10px; 
-            overflow: hidden;
-            box-shadow: inset 0 1px 3px rgba(0,0,0,0.1);
+            border-radius: 6px; 
+            overflow: hidden; 
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.05); 
         }
         
         .progress-fill { 
             height: 100%; 
-            transition: width 0.6s ease; 
-            border-radius: 10px;
-            position: relative;
-            overflow: hidden;
+            transition: width 0.5s ease; 
+            border-radius: 6px; 
         }
         
-        .progress-fill::after {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            bottom: 0;
-            right: 0;
-            background-image: linear-gradient(45deg, rgba(255,255,255,0.2) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.2) 50%, rgba(255,255,255,0.2) 75%, transparent 75%, transparent);
-            background-size: 20px 20px;
-            animation: move-stripes 1s linear infinite;
+        .pulse { 
+            animation: pulse 1.5s infinite; 
         }
         
-        @keyframes move-stripes {
-            0% { background-position: 0 0; }
-            100% { background-position: 20px 20px; }
+        @keyframes pulse { 
+            0% { opacity: 1; } 
+            50% { opacity: 0.6; } 
+            100% { opacity: 1; } 
         }
         
         .status-running .progress-fill { 
             background: linear-gradient(135deg, #f39c12, #e67e22); 
         }
+        
         .status-completed .progress-fill { 
             background: linear-gradient(135deg, #27ae60, #219a52); 
         }
+        
         .status-failed .progress-fill { 
             background: linear-gradient(135deg, #e74c3c, #c0392b); 
         }
+        
         .status-timedout .progress-fill { 
             background: linear-gradient(135deg, #e67e22, #d35400); 
+        }
+        
+        .status-queued .progress-fill { 
+            background: linear-gradient(135deg, #95a5a6, #7f8c8d); 
         }
         
         .last-update { 
@@ -951,19 +1116,26 @@ function Export-RunspaceHtmlDashboard {
             font-size: 0.85em; 
             text-align: center; 
             margin-top: 30px; 
-            padding: 20px;
-            background: #f8f9fa;
-            border-radius: 0 0 15px 15px;
+            padding: 20px; 
+            background: #f8f9fa; 
+            border-radius: 0 0 15px 15px; 
         }
         
-        .pulse {
-            animation: pulse 2s infinite;
+        /* Optional: Add a subtle animation for running tasks */
+        @keyframes subtleGlow {
+            0% {
+                box-shadow: 0 4px 12px rgba(243, 156, 18, 0.1);
+            }
+            50% {
+                box-shadow: 0 4px 12px rgba(243, 156, 18, 0.3);
+            }
+            100% {
+                box-shadow: 0 4px 12px rgba(243, 156, 18, 0.1);
+            }
         }
         
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.7; }
-            100% { opacity: 1; }
+        .task.status-running {
+            animation: subtleGlow 2s ease-in-out infinite;
         }
     </style>
 </head>
@@ -973,48 +1145,56 @@ function Export-RunspaceHtmlDashboard {
             <h1>🚀 PowerShell Runspace Dashboard</h1>
             <p>Real-time monitoring of parallel runspace execution</p>
         </div>
-        
         <div id="content">
             <p style="text-align: center; padding: 40px; color: #666;">Loading dashboard data...</p>
         </div>
     </div>
-    
     <script>
-        // Embedded JSON data
         const dashboardData = $jsonData;
+        
+        function getStatusIcon(status) {
+            const icons = {
+                'Queued': '⏳',
+                'Running': '⚡',
+                'Completed': '✅',
+                'TimedOut': '⏰',
+                'Failed': '❌'
+            };
+            return icons[status] || '❓';
+        }
         
         function updateDashboard(data) {
             const summary = data.Summary;
             const tasks = data.Tasks;
-            
             let html = '';
             
             // Summary cards
             html += '<div class="summary">';
             html += '<div class="summary-card total"><h3>' + summary.Total + '</h3><p>Total Tasks</p></div>';
-            html += '<div class="summary-card completed"><h3 style="color: #27ae60;">' + summary.Completed + '</h3><p>Completed</p></div>';
-            html += '<div class="summary-card running"><h3 style="color: #f39c12;">' + summary.Running + '</h3><p>Running</p></div>';
-            html += '<div class="summary-card failed"><h3 style="color: #e74c3c;">' + summary.Failed + '</h3><p>Failed</p></div>';
+            html += '<div class="summary-card completed"><h3>' + summary.Completed + '</h3><p>Completed</p></div>';
+            html += '<div class="summary-card running"><h3>' + summary.Running + '</h3><p>Running</p></div>';
+            html += '<div class="summary-card failed"><h3>' + summary.Failed + '</h3><p>Failed</p></div>';
+            html += '<div class="summary-card queued"><h3>' + summary.Queued + '</h3><p>Queued</p></div>';
             html += '</div>';
             
-            // Task details
+            // Task grid
             html += '<div class="task-container">';
             html += '<h2>📊 Task Progress</h2>';
+            html += '<div class="task-grid">';
             
             tasks.forEach(task => {
                 const statusClass = 'status-' + task.Status.toLowerCase();
-                const statusIcon = task.Status === 'Running' ? '⚡' : 
-                                 task.Status === 'Completed' ? '✅' : 
-                                 task.Status === 'TimedOut' ? '⏰' : '❌';
-                                 
+                const statusIcon = getStatusIcon(task.Status);
                 const pulseClass = task.Status === 'Running' ? 'pulse' : '';
                 
                 html += '<div class="task ' + statusClass + '">';
                 html += '<div class="task-header">';
-                html += '<div class="task-name"><span class="status-icon ' + pulseClass + '">' + statusIcon + '</span>' + task.Description + '</div>';
-                html += '<div class="task-status">' + task.Status + ' (' + task.Runtime + 's)</div>';
+                html += '<div class="task-name">';
+                html += '<span class="status-icon ' + pulseClass + '">' + statusIcon + '</span>';
+                html += '<span>' + task.Description + '</span>';
                 html += '</div>';
-                
+                html += '<div><span class="task-status">' + task.Status + ' (' + task.Runtime + 's)</span></div>';
+                html += '</div>';
                 html += '<div class="progress-container">';
                 html += '<div class="progress-label">';
                 html += '<span>Progress</span>';
@@ -1024,33 +1204,35 @@ function Export-RunspaceHtmlDashboard {
                 html += '<div class="progress-fill" style="width: ' + task.Progress + '%"></div>';
                 html += '</div>';
                 html += '</div>';
-                
                 html += '</div>';
             });
             
-            html += '</div>';
+            html += '</div></div>';
             html += '<div class="last-update">⏱️ Last updated: ' + data.LastUpdate + '</div>';
             
             document.getElementById('content').innerHTML = html;
         }
         
-        // Load embedded data
         updateDashboard(dashboardData);
     </script>
 </body>
 </html>
 "@
-    
-    $html | Out-File $htmlPath -Force
+
+    # Write with UTF-8 encoding to ensure emojis display correctly
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($htmlPath, $html, $utf8NoBom)
 
     # Only launch browser if dashboard was just created AND LaunchBrowser was requested
-    if ($LaunchBrowser -and $dashboardCreated) {
+    if ($LaunchBrowser) {
         $fullPath = Resolve-Path $htmlPath
         $null = Start-Process $fullPath
         Write-Host "Dashboard launched in browser..." -ForegroundColor Cyan
     }
     
-    Write-Host "Dashboard exported to: $htmlPath" -ForegroundColor Green
+    if (-not $Quiet) {
+        Write-Host "Dashboard exported to: $htmlPath" -ForegroundColor Green
+    }
 }
 
 function Stop-RunspacePool {
@@ -1084,9 +1266,3 @@ function Stop-RunspacePool {
 #endregion
 
 Write-Verbose "Runspace Management Functions Loaded!"
-
-<# Example usage:
-
-Invoke-ParallelRunspaceExample -NumberOfTasks 8 -MaxConcurrentRunspaces 4 -OutputType 'Visual'
-
-#>
