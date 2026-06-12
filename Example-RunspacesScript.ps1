@@ -44,7 +44,7 @@ $CompanyPrefix = "ACME-CORP"
 
 # Define list of servers to process
 $ServerTypes = @("DC", "WEB", "SQL", "APP", "FILE")
-$ServerList = 1..5 | ForEach-Object {
+$ServerList = 1..1 | ForEach-Object {
     $padded = "{0:D2}" -f $_
     foreach ($type in $ServerTypes) {
         "$type-$padded"

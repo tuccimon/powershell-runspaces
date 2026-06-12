@@ -706,6 +706,10 @@ Are you sure you want to use this output mode?
         Start-Sleep -Milliseconds 500  # Brief pause to let everything settle
         $null = Show-VisualProgress -Tasks $Tasks -DisplayConfig $DisplayConfig -TotalTasks $totalTasks -PollingIntervalMs $PollingIntervalMs -IsFinalDisplay
     }
+    elseif ($OutputType -eq 'HtmlDashboard') {
+        $null = Export-RunspaceHtmlDashboard -Tasks $Tasks -Quiet -Completed
+    }
+
 }
 
 function Get-RunspaceResults {
@@ -805,11 +809,17 @@ function Export-RunspaceHtmlDashboard {
         
         [string]$OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath "Dashboard"),
         
+        [ValidateScript({
+            $_ -gt 0
+        })]
         [int]$RefreshIntervalSeconds = 2,
         
         [switch]$LaunchBrowser,
 
-        [switch]$Quiet
+        [switch]$Quiet,
+
+        # only used during finalization
+        [switch]$Completed
     )
     
     # Create output directory
@@ -856,13 +866,22 @@ function Export-RunspaceHtmlDashboard {
     # Create HTML with embedded JSON data and UTF-8 encoding
     $htmlPath = "$OutputPath\dashboard.html"
 
+    if ($Completed) {
+        $isCompleted = "true"
+        $refreshTag = ''
+    }
+    else {
+        $isCompleted = "false"
+        $refreshTag = "<meta http-equiv=`"refresh`" content=`"$RefreshIntervalSeconds`">"
+    }
+
     $html = @"
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="$RefreshIntervalSeconds">
+    $refreshTag
     <title>PowerShell Runspace Dashboard</title>
     <style>
         * { 
@@ -1138,6 +1157,7 @@ function Export-RunspaceHtmlDashboard {
             animation: subtleGlow 2s ease-in-out infinite;
         }
     </style>
+    <link rel="icon" type="image/svg+xml" id="dynamicFavicon">
 </head>
 <body>
     <div class="container">
@@ -1151,7 +1171,7 @@ function Export-RunspaceHtmlDashboard {
     </div>
     <script>
         const dashboardData = $jsonData;
-        
+
         function getStatusIcon(status) {
             const icons = {
                 'Queued': '⏳',
@@ -1162,12 +1182,35 @@ function Export-RunspaceHtmlDashboard {
             };
             return icons[status] || '❓';
         }
+
+        // Function to update the favicon based on current status
+        function updateFavicon(allDone) {
+            const faviconLink = document.getElementById('dynamicFavicon');
+            let svgContent = '';
+            
+            // could just start as rocket and then only run this function when completed but leaving this
+            // here as a placeholder can allow for multiple icons to denote progress updates in the future
+            if (allDone) {
+                // All done - green checkmark
+                svgContent = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="45" fill="#27ae60"/><text x="50" y="72" text-anchor="middle" font-size="50" fill="white">✓</text></svg>';
+            } else {
+                // Still running - rocket icon
+                svgContent = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="45" fill="#f39c12"/><text x="50" y="72" text-anchor="middle" font-size="50" fill="white">🚀</text></svg>';
+            }
         
-        function updateDashboard(data) {
+            // Update the favicon
+            const encodedSvg = 'data:image/svg+xml,' + encodeURIComponent(svgContent);
+            faviconLink.href = encodedSvg;
+        }
+
+        function updateDashboard(data, isCompleted) {
             const summary = data.Summary;
             const tasks = data.Tasks;
             let html = '';
             
+            // update favicon based on status
+            updateFavicon(isCompleted);
+
             // Summary cards
             html += '<div class="summary">';
             html += '<div class="summary-card total"><h3>' + summary.Total + '</h3><p>Total Tasks</p></div>';
@@ -1212,8 +1255,8 @@ function Export-RunspaceHtmlDashboard {
             
             document.getElementById('content').innerHTML = html;
         }
-        
-        updateDashboard(dashboardData);
+
+        updateDashboard(dashboardData, $isCompleted);
     </script>
 </body>
 </html>
@@ -1232,6 +1275,12 @@ function Export-RunspaceHtmlDashboard {
     
     if (-not $Quiet) {
         Write-Host "Dashboard exported to: $htmlPath" -ForegroundColor Green
+    }
+
+    if ($Completed) {
+        # clean up html dashboard file
+        Start-Sleep -Seconds ($RefreshIntervalSeconds + 1)
+        $null = Remove-Item -Path $htmlPath -ErrorAction SilentlyContinue
     }
 }
 
